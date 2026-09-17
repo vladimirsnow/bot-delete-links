@@ -37,7 +37,8 @@ export default async function handler(req, res) {
 
     // ==========================================
     // 1. ИСКЛЮЧЕНИЕ: ЦЕЛЕВОЙ ПОЛЬЗОВАТЕЛЬ (TARGET_USER_ID)
-    // Удаляем любые сообщения со ссылками без скачивания видео
+    // Удаляем любые ссылки, а также фото и видео.
+    // Исключения (НЕ удаляем, если нет ссылок): голосовые, кружочки (video_note), аудио, обычные файлы (document).
     // ==========================================
     if (senderId === targetId) {
       const hasEntityUrl = entities.some(
@@ -47,10 +48,17 @@ export default async function handler(req, res) {
         /(?:https?:\/\/|www\.)[^\s<>()]+|(?<![@\w])(?:[a-z0-9-]+\.)+(?:com|net|org|io|me|ru|kz|tv|cc|ly|co)(?:\/[^\s<>()]*)?/i;
 
       const hasUrl = hasEntityUrl || urlRegex.test(text);
+      const hasPhoto = Array.isArray(message.photo) && message.photo.length > 0;
+      const hasVideo = Boolean(message.video);
 
-      if (hasUrl) {
+      if (hasUrl || hasPhoto || hasVideo) {
         await deleteTelegramMessage(token, chatId, messageId);
-        console.log(`Deleted link message from target user ${targetId}`);
+        const reason = hasUrl
+          ? "link"
+          : hasPhoto
+          ? "photo"
+          : "video";
+        console.log(`Deleted ${reason} message from target user ${targetId}`);
       }
 
       return res.status(200).json({ ok: true });
