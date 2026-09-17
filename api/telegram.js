@@ -5,6 +5,7 @@ export default async function handler(req, res) {
 
   const token = process.env.BOT_TOKEN;
   const targetId = Number(process.env.TARGET_USER_ID || "6056988812");
+  const otherBotId = Number(process.env.OTHER_BOT_ID || "5052984662");
 
   if (!token) {
     console.error("BOT_TOKEN is not configured");
@@ -15,26 +16,50 @@ export default async function handler(req, res) {
     const update = req.body || {};
     const message = update.message || update.edited_message;
 
-    if (!message || !message.from || message.from.id !== targetId) {
+    if (!message || !message.from) {
       return res.status(200).json({ ok: true });
     }
 
-    const text = message.text || message.caption || "";
-    const entities = [
-      ...(message.entities || []),
-      ...(message.caption_entities || [])
-    ];
+    const senderId = message.from.id;
+    let shouldDelete = false;
+    let reason = "";
 
-    const hasEntityUrl = entities.some(
-      e => e.type === "url" || e.type === "text_link"
-    );
+    // 1. Проверяем целевого пользователя: удаляем, если есть ссылка
+    if (senderId === targetId) {
+      const text = message.text || message.caption || "";
+      const entities = [
+        ...(message.entities || []),
+        ...(message.caption_entities || [])
+      ];
 
-    const urlRegex =
-      /(?:https?:\/\/|www\.)[^\s<>()]+|(?<![@\w])(?:[a-z0-9-]+\.)+(?:com|net|org|io|me|ru|kz|tv|cc|ly|co)(?:\/[^\s<>()]*)?/i;
+      const hasEntityUrl = entities.some(
+        e => e.type === "url" || e.type === "text_link"
+      );
 
-    const hasUrl = hasEntityUrl || urlRegex.test(text);
+      const urlRegex =
+        /(?:https?:\/\/|www\.)[^\s<>()]+|(?<![@\w])(?:[a-z0-9-]+\.)+(?:com|net|org|io|me|ru|kz|tv|cc|ly|co)(?:\/[^\s<>()]*)?/i;
 
-    if (!hasUrl) {
+      const hasUrl = hasEntityUrl || urlRegex.test(text);
+      if (hasUrl) {
+        shouldDelete = true;
+        reason = `link from target user ${targetId}`;
+      }
+    }
+
+    // 2. Проверяем второго бота (OTHER_BOT_ID): удаляем, если без ответа или ответом на TARGET_USER_ID
+    if (senderId === otherBotId) {
+      const isReply = Boolean(message.reply_to_message);
+      const isReplyToTarget = message.reply_to_message?.from?.id === targetId;
+
+      if (!isReply || isReplyToTarget) {
+        shouldDelete = true;
+        reason = isReplyToTarget
+          ? `bot ${otherBotId} replied to target user ${targetId}`
+          : `bot ${otherBotId} sent message without reply`;
+      }
+    }
+
+    if (!shouldDelete) {
       return res.status(200).json({ ok: true });
     }
 
@@ -63,7 +88,7 @@ export default async function handler(req, res) {
       console.error("Telegram deleteMessage failed:", result);
     } else {
       console.log(
-        `Deleted message ${messageId} from ${targetId} in chat ${chatId}`
+        `Deleted message ${messageId} in chat ${chatId} (${reason})`
       );
     }
 
