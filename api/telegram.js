@@ -1,4 +1,5 @@
 import { extractMediaUrl, resolveMedia } from "./downloader.js";
+import { searchTrack } from "./music.js";
 
 export const config = {
   maxDuration: 60
@@ -6,7 +7,7 @@ export const config = {
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    return res.status(200).json({ ok: true, service: "telegram-media-and-moderation-bot" });
+    return res.status(200).json({ ok: true, service: "telegram-media-and-music-bot" });
   }
 
   const token = process.env.BOT_TOKEN;
@@ -29,7 +30,7 @@ export default async function handler(req, res) {
     const chatId = message.chat.id;
     const messageId = message.message_id;
 
-    const text = message.text || message.caption || "";
+    const text = (message.text || message.caption || "").trim();
     const entities = [
       ...(message.entities || []),
       ...(message.caption_entities || [])
@@ -65,14 +66,60 @@ export default async function handler(req, res) {
     }
 
     // ==========================================
-    // 2. ДРУГИЕ ПОЛЬЗОВАТЕЛИ
-    // Ищем ссылки на TikTok, Instagram Reels, YouTube Shorts,
-    // скачиваем и отправляем видео/фото ответом на сообщение БЕЗ подписей
+    // 2. ПОИСК МУЗЫКИ ПО КЛЮЧЕВОМУ СЛОВУ "найти"
+    // Пример: "найти название трека", "найти кусок текста песни", "/найти ..."
+    // ==========================================
+    const musicMatch = text.match(/^\s*(?:\/)?найти(?:[:\s]+(.+))?$/i);
+    if (musicMatch) {
+      const songQuery = (musicMatch[1] || "").trim();
+
+      if (!songQuery) {
+        await sendTelegramMessage(
+          token,
+          chatId,
+          messageId,
+          "🎵 Чтобы найти музыку, напишите:\n`найти <название трека или слова из песни>`"
+        );
+        return res.status(200).json({ ok: true });
+      }
+
+      console.log(`[Telegram] Music request: "${songQuery}" in chat ${chatId}`);
+      await sendTelegramChatAction(token, chatId, "upload_voice");
+
+      const track = await searchTrack(songQuery);
+
+      if (track && track.url) {
+        const sent = await sendTelegramAudio(token, chatId, messageId, track);
+        if (!sent) {
+          await sendTelegramMessage(
+            token,
+            chatId,
+            messageId,
+            `❌ Не удалось загрузить аудио для "${track.title}". Попробуйте другой запрос.`
+          );
+        }
+      } else {
+        await sendTelegramMessage(
+          token,
+          chatId,
+          messageId,
+          `🔍 По запросу «${songQuery}» ничего не найдено.\nПопробуйте указать автора или другие слова из песни.`
+        );
+      }
+
+      return res.status(200).json({ ok: true });
+    }
+
+    // ==========================================
+    // 3. СКАЧИВАНИЕ И ОТПРАВКА TIKTOK, INSTAGRAM, YOUTUBE SHORTS
+    // Ищем ссылки на видео/рилсы/шортсы и отправляем ответом БЕЗ подписей
     // ==========================================
     const mediaUrl = extractMediaUrl(text, entities);
 
     if (mediaUrl) {
       console.log(`Detected media URL: ${mediaUrl} in chat ${chatId}`);
+      await sendTelegramChatAction(token, chatId, "upload_video");
+
       const media = await resolveMedia(mediaUrl);
 
       if (media) {
@@ -96,6 +143,42 @@ export default async function handler(req, res) {
 }
 
 /**
+ * Индикатор действия бота (upload_video, upload_voice, typing)
+ */
+async function sendTelegramChatAction(token, chatId, action) {
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, action: action })
+    });
+  } catch {
+    // Игнорируем ошибку индикатора
+  }
+}
+
+/**
+ * Отправка текстового сообщения
+ */
+async function sendTelegramMessage(token, chatId, replyToMessageId, text) {
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+        reply_to_message_id: replyToMessageId,
+        allow_sending_without_reply: true,
+        parse_mode: "Markdown"
+      })
+    });
+  } catch (err) {
+    console.error("sendTelegramMessage error:", err.message);
+  }
+}
+
+/**
  * Удаление сообщения
  */
 async function deleteTelegramMessage(token, chatId, messageId) {
@@ -114,9 +197,77 @@ async function deleteTelegramMessage(token, chatId, messageId) {
 }
 
 /**
+ * Отправка аудио ответом на сообщение
+ */
+async function sendTelegramAudio(token, chatId, replyToMessageId, track) {
+  // 1. Попытка отправить через прямую ссылку
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendAudio`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        audio: track.url,
+        title: track.title,
+        performer: track.performer,
+        duration: track.duration,
+        reply_to_message_id: replyToMessageId,
+        allow_sending_without_reply: true
+      })
+    });
+
+    const data = await res.json();
+    if (data.ok) return true;
+
+    console.warn("sendAudio direct URL failed, attempting buffer upload:", data.description);
+  } catch (err) {
+    console.warn("sendAudio direct URL error:", err.message);
+  }
+
+  // 2. Фоллбек: скачиваем аудио в буфер и отправляем через multipart/form-data
+  try {
+    const audioRes = await fetch(track.url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": track.source === "muzofond" ? "https://muzofond.fm/" : "https://www.youtube.com/"
+      }
+    });
+
+    if (!audioRes.ok) return false;
+
+    const arrayBuf = await audioRes.arrayBuffer();
+    const formData = new FormData();
+    formData.append("chat_id", String(chatId));
+    formData.append(
+      "audio",
+      new Blob([arrayBuf], { type: "audio/mpeg" }),
+      `${(track.title || "audio").replace(/[\/\\?%*:|"<>]/g, "_")}.mp3`
+    );
+    if (track.title) formData.append("title", track.title);
+    if (track.performer) formData.append("performer", track.performer);
+    if (track.duration) formData.append("duration", String(track.duration));
+    if (replyToMessageId) formData.append("reply_to_message_id", String(replyToMessageId));
+    formData.append("allow_sending_without_reply", "true");
+
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendAudio`, {
+      method: "POST",
+      body: formData
+    });
+
+    const data = await res.json();
+    return Boolean(data.ok);
+  } catch (err) {
+    console.error("sendAudio buffer upload error:", err.message);
+    return false;
+  }
+}
+
+/**
  * Отправка видео ответом на сообщение (без подписи)
  */
 async function sendTelegramVideo(token, chatId, replyToMessageId, videoUrl) {
+  // 1. Попытка отправить через прямую ссылку
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendVideo`, {
       method: "POST",
@@ -131,11 +282,52 @@ async function sendTelegramVideo(token, chatId, replyToMessageId, videoUrl) {
     });
 
     const data = await res.json();
-    if (!data.ok) {
-      console.error("sendTelegramVideo failed:", data);
-    }
+    if (data.ok) return true;
+
+    console.warn("sendTelegramVideo direct URL failed, attempting buffer upload:", data.description);
   } catch (err) {
-    console.error("sendTelegramVideo error:", err.message);
+    console.warn("sendTelegramVideo direct URL error:", err.message);
+  }
+
+  // 2. Фоллбек: скачивание и отправка через буфер (до 50MB)
+  try {
+    const videoRes = await fetch(videoUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+      }
+    });
+
+    if (!videoRes.ok) return false;
+
+    const contentLength = Number(videoRes.headers.get("content-length") || "0");
+    if (contentLength > 50 * 1024 * 1024) {
+      console.error("Video file is larger than 50MB, cannot send via bot API");
+      return false;
+    }
+
+    const arrayBuf = await videoRes.arrayBuffer();
+    const formData = new FormData();
+    formData.append("chat_id", String(chatId));
+    formData.append(
+      "video",
+      new Blob([arrayBuf], { type: "video/mp4" }),
+      "video.mp4"
+    );
+    if (replyToMessageId) formData.append("reply_to_message_id", String(replyToMessageId));
+    formData.append("allow_sending_without_reply", "true");
+    formData.append("supports_streaming", "true");
+
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendVideo`, {
+      method: "POST",
+      body: formData
+    });
+
+    const data = await res.json();
+    return Boolean(data.ok);
+  } catch (err) {
+    console.error("sendTelegramVideo buffer upload error:", err.message);
+    return false;
   }
 }
 
