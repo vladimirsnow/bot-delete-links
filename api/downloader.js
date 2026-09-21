@@ -7,19 +7,33 @@ const USER_AGENT =
 const BOT_USER_AGENT = "TelegramBot (like TwitterBot)";
 
 /**
+ * Хелпер для fetch с таймаутом (устраняет задержки)
+ */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(id);
+    return res;
+  } catch (err) {
+    clearTimeout(id);
+    throw err;
+  }
+}
+
+/**
  * Извлекает первую ссылку на TikTok, Instagram или YouTube Shorts из текста/entities
  */
 export function extractMediaUrl(text, entities = []) {
   if (!text) return null;
 
-  // 1. Проверяем entities (явные ссылки и гиперссылки)
   for (const entity of entities) {
     if (entity.type === "text_link" && entity.url) {
       if (isSupportedMediaUrl(entity.url)) return entity.url;
     }
   }
 
-  // 2. Ищем регулярным выражением
   const regex =
     /https?:\/\/(?:[a-zA-Z0-9-]+\.)?(?:tiktok\.com|instagram\.com|youtube\.com|youtu\.be)\/[^\s<>()]+/i;
   const match = text.match(regex);
@@ -48,25 +62,17 @@ export async function resolveMedia(url) {
 
   // TikTok
   if (/tiktok\.com/i.test(url)) {
-    const result = await resolveTikTok(url);
-    if (result) return result;
+    return await resolveTikTok(url);
   }
 
   // Instagram (Reels, Posts)
   if (/instagram\.com/i.test(url)) {
-    const result = await resolveInstagram(url);
-    if (result) return result;
+    return await resolveInstagram(url);
   }
 
   // YouTube Shorts / Video
   if (/youtube\.com|youtu\.be/i.test(url)) {
-    const result = await resolveYouTube(url);
-    if (result) return result;
-  }
-
-  // Универсальный фоллбек через Cobalt (если задан кастомный инстанс)
-  if (process.env.COBALT_API_URL) {
-    return await resolveViaCobalt(url);
+    return await resolveYouTube(url);
   }
 
   return null;
@@ -76,22 +82,25 @@ export async function resolveMedia(url) {
  * Резолвер для TikTok с мульти-уровневым фоллбеком
  */
 async function resolveTikTok(url) {
-  // 1. TikWM API
+  // 1. TikWM API (< 1c)
   try {
-    const res = await fetch("https://www.tikwm.com/api/", {
-      method: "POST",
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Referer": "https://www.tikwm.com/",
-        "Content-Type": "application/x-www-form-urlencoded"
+    const res = await fetchWithTimeout(
+      "https://www.tikwm.com/api/",
+      {
+        method: "POST",
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Referer": "https://www.tikwm.com/",
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({ url, count: "12", cursor: "0", web: "1", hd: "1" })
       },
-      body: new URLSearchParams({ url, count: "12", cursor: "0", web: "1", hd: "1" })
-    });
+      3000
+    );
 
     if (res.ok) {
       const data = await res.json();
       if (data && data.data) {
-        // Слайд-шоу с фотографиями
         if (Array.isArray(data.data.images) && data.data.images.length > 0) {
           return {
             type: "photos",
@@ -99,7 +108,6 @@ async function resolveTikTok(url) {
           };
         }
 
-        // Видео
         const videoUrl = data.data.hdplay || data.data.play || data.data.wmplay;
         if (videoUrl) {
           const fullUrl = videoUrl.startsWith("http")
@@ -113,12 +121,16 @@ async function resolveTikTok(url) {
       }
     }
   } catch (err) {
-    console.error("resolveTikTok TikWM error:", err.message);
+    console.warn("resolveTikTok TikWM error:", err.message);
   }
 
   // 2. Tiklydown API
   try {
-    const res = await fetch(`https://api.tiklydown.eu.org/api/download?url=${encodeURIComponent(url)}`);
+    const res = await fetchWithTimeout(
+      `https://api.tiklydown.eu.org/api/download?url=${encodeURIComponent(url)}`,
+      {},
+      3000
+    );
     if (res.ok) {
       const data = await res.json();
       if (data.images && Array.isArray(data.images) && data.images.length > 0) {
@@ -133,29 +145,93 @@ async function resolveTikTok(url) {
       }
     }
   } catch (err) {
-    console.error("resolveTikTok Tiklydown error:", err.message);
+    console.warn("resolveTikTok Tiklydown error:", err.message);
   }
 
-  // 3. btch.douyin / ttdl fallback
+  // 3. btch.douyin fallback
   try {
-    const data = await btch.douyin(url);
+    const data = await Promise.race([
+      btch.douyin(url),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("btch timeout")), 3000))
+    ]);
     if (data && data.status && data.result?.video) {
       return { type: "video", url: data.result.video };
     }
   } catch (err) {
-    console.error("resolveTikTok btch error:", err.message);
+    console.warn("resolveTikTok btch error:", err.message);
   }
 
   return null;
 }
 
 /**
+ * Извлекает shortcode из Instagram URL
+ */
+function extractInstagramShortcode(url) {
+  const match = url.match(/instagram\.com\/(?:reel|reels|p|share)\/([a-zA-Z0-9_-]+)/i);
+  return match ? match[1] : null;
+}
+
+/**
  * Резолвер для Instagram (Reels / Posts / Photos)
  */
 async function resolveInstagram(url) {
-  // 1. Попытка через btch.igdl
+  const shortcode = extractInstagramShortcode(url);
+
+  // 1. Попытка через официальный GraphQL Polaris API (если задан INSTAGRAM_COOKIE в .env, работает 100%)
+  if (shortcode) {
+    try {
+      const gqlResult = await resolveInstagramGraphQL(shortcode);
+      if (gqlResult) return gqlResult;
+    } catch (err) {
+      console.warn("resolveInstagram GraphQL error:", err.message);
+    }
+  }
+
+  // 2. Попытка через Discord/Telegram прокси eeinstagram / ddinstagram / vxinstagram
+  if (shortcode) {
+    const proxyHosts = [
+      `https://eeinstagram.com/reel/${shortcode}`,
+      `https://ddinstagram.com/reel/${shortcode}`,
+      `https://vxinstagram.com/reel/${shortcode}`,
+      `https://instagramez.com/reel/${shortcode}`
+    ];
+
+    for (const pUrl of proxyHosts) {
+      try {
+        const res = await fetchWithTimeout(
+          pUrl,
+          { headers: { "User-Agent": BOT_USER_AGENT } },
+          2500
+        );
+        if (res.ok) {
+          const html = await res.text();
+          const videoMatch =
+            html.match(/<meta\s+(?:property|name)=["'](?:og:video(?::secure_url)?|twitter:player:stream)["']\s+content=["']([^"']+)["']/i) ||
+            html.match(/content=["']([^"']+)["'][^>]+(?:og:video|twitter:player:stream)/i);
+          if (videoMatch && videoMatch[1] && videoMatch[1].startsWith("http")) {
+            return { type: "video", url: videoMatch[1] };
+          }
+
+          const photoMatch =
+            html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i) ||
+            html.match(/content=["']([^"']+)["'][^>]+og:image/i);
+          if (photoMatch && photoMatch[1] && photoMatch[1].startsWith("http") && !photoMatch[1].includes("ddinstagram")) {
+            return { type: "photo", url: photoMatch[1] };
+          }
+        }
+      } catch {
+        // переходим к следующему прокси
+      }
+    }
+  }
+
+  // 3. Попытка через btch.igdl (таймаут 3с)
   try {
-    const data = await btch.igdl(url);
+    const data = await Promise.race([
+      btch.igdl(url),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("btch.igdl timeout")), 3000))
+    ]);
     if (data && data.status && Array.isArray(data.result)) {
       const validMedia = data.result.filter(item => item.url && item.url.startsWith("http"));
       if (validMedia.length > 1) {
@@ -173,62 +249,96 @@ async function resolveInstagram(url) {
       }
     }
   } catch (err) {
-    console.error("resolveInstagram btch error:", err.message);
+    console.warn("resolveInstagram btch error:", err.message);
   }
 
-  // 2. Попытка через OpenGraph / embed
-  try {
-    const cleanUrl = url.split("?")[0].replace(/\/+$/, "");
-    const embedUrl = `${cleanUrl}/embed/captioned/`;
-    const res = await fetch(embedUrl, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9"
-      }
-    });
-
-    if (res.ok) {
-      const html = await res.text();
-      const videoMatch = html.match(/"video_url":"([^"]+)"/);
-      if (videoMatch && videoMatch[1]) {
-        const videoUrl = JSON.parse(`"${videoMatch[1]}"`);
-        return { type: "video", url: videoUrl };
-      }
-
-      const imgMatch = html.match(/"display_url":"([^"]+)"/);
-      if (imgMatch && imgMatch[1]) {
-        const photoUrl = JSON.parse(`"${imgMatch[1]}"`);
-        return { type: "photo", url: photoUrl };
-      }
-    }
-  } catch (err) {
-    console.error("resolveInstagram embed error:", err.message);
+  // 4. Универсальный фоллбек через Cobalt (если задан COBALT_API_URL)
+  if (process.env.COBALT_API_URL) {
+    return await resolveViaCobalt(url);
   }
 
-  // 3. Попытка через ddinstagram / vxinstagram
-  try {
-    const ddUrl = url.replace(/(?:www\.)?instagram\.com/i, "ddinstagram.com");
-    const res = await fetch(ddUrl, {
-      headers: { "User-Agent": BOT_USER_AGENT }
-    });
-    if (res.ok) {
-      const html = await res.text();
-      const videoMatch =
-        html.match(/<meta\s+property=["']og:video(?::secure_url)?["']\s+content=["']([^"']+)["']/i) ||
-        html.match(/<meta\s+name=["']twitter:player:stream["']\s+content=["']([^"']+)["']/i);
-      if (videoMatch && videoMatch[1]) {
-        return { type: "video", url: videoMatch[1] };
-      }
+  return null;
+}
 
-      const photoMatch = html.match(
-        /<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i
-      );
-      if (photoMatch && photoMatch[1]) {
-        return { type: "photo", url: photoMatch[1] };
-      }
+/**
+ * GraphQL резолвер для Instagram
+ */
+async function resolveInstagramGraphQL(shortcode) {
+  const bodyParams = new URLSearchParams({
+    av: "0",
+    __d: "www",
+    __user: "0",
+    __a: "1",
+    __req: "b",
+    dpr: "3",
+    __ccg: "GOOD",
+    lsd: "AVrqPT0gJDo",
+    jazoest: "2946",
+    fb_api_caller_class: "RelayModern",
+    fb_api_req_friendly_name: "PolarisPostActionLoadPostQueryQuery",
+    variables: JSON.stringify({
+      shortcode: shortcode,
+      fetch_tagged_user_count: null,
+      hoisted_comment_id: null,
+      hoisted_reply_id: null
+    }),
+    server_timestamps: "true",
+    doc_id: "8845758582119845"
+  });
+
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/14.2 Chrome/87.0.4280.141 Mobile Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Content-Type": "application/x-www-form-urlencoded",
+    "X-FB-Friendly-Name": "PolarisPostActionLoadPostQueryQuery",
+    "X-CSRFToken": "uy8OpI1kndx4oUHjlHaUfu",
+    "X-IG-App-ID": "1217981644879628",
+    "X-FB-LSD": "AVrqPT0gJDo",
+    "X-ASBD-ID": "359341",
+    "Referer": `https://www.instagram.com/p/${shortcode}/`
+  };
+
+  const cookie = process.env.INSTAGRAM_COOKIE || process.env.INSTAGRAM_SESSION_ID;
+  if (cookie) {
+    headers["Cookie"] = cookie.includes("sessionid=") ? cookie : `sessionid=${cookie}`;
+  }
+
+  const res = await fetchWithTimeout(
+    "https://www.instagram.com/graphql/query",
+    {
+      method: "POST",
+      headers,
+      body: bodyParams.toString()
+    },
+    3500
+  );
+
+  if (!res.ok) return null;
+
+  const json = await res.json();
+  const media = json.data?.xdt_shortcode_media;
+  if (!media) return null;
+
+  // Карусель фото/видео
+  if (media.edge_sidecar_to_children?.edges?.length > 0) {
+    const photos = media.edge_sidecar_to_children.edges
+      .map(edge => edge.node?.display_url)
+      .filter(Boolean);
+    if (photos.length > 0) {
+      return { type: "photos", urls: photos };
     }
-  } catch (err) {
-    console.error("resolveInstagram ddinstagram error:", err.message);
+  }
+
+  // Видео
+  if (media.is_video && media.video_url) {
+    return { type: "video", url: media.video_url };
+  }
+
+  // Фото
+  if (media.display_url) {
+    return { type: "photo", url: media.display_url };
   }
 
   return null;
@@ -238,9 +348,12 @@ async function resolveInstagram(url) {
  * Резолвер для YouTube Shorts / Video
  */
 async function resolveYouTube(url) {
-  // 1. Попытка через btch.youtube (возвращает прямые mp4 потоки)
   try {
-    const ytData = await btch.youtube(url);
+    const ytData = await Promise.race([
+      btch.youtube(url),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("btch.youtube timeout")), 4000))
+    ]);
+
     if (ytData && ytData.status && ytData.mp4) {
       return {
         type: "video",
@@ -248,20 +361,18 @@ async function resolveYouTube(url) {
       };
     }
   } catch (err) {
-    console.error("resolveYouTube btch error:", err.message);
+    console.warn("resolveYouTube error:", err.message);
   }
 
-  // 2. Универсальный фоллбек через Cobalt (если сконфигурирован кастомный инстанс)
   if (process.env.COBALT_API_URL) {
-    const cobaltRes = await resolveViaCobalt(url);
-    if (cobaltRes) return cobaltRes;
+    return await resolveViaCobalt(url);
   }
 
   return null;
 }
 
 /**
- * Универсальный резолвер через Cobalt API (если указан в COBALT_API_URL)
+ * Фоллбек через кастомный инстанс Cobalt
  */
 async function resolveViaCobalt(url) {
   const customCobalt = process.env.COBALT_API_URL;
@@ -269,42 +380,40 @@ async function resolveViaCobalt(url) {
 
   try {
     const apiUrl = customCobalt.endsWith("/") ? customCobalt : `${customCobalt}/`;
-    const res = await fetch(apiUrl, {
-      method: "POST",
-      headers: {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT
+    const res = await fetchWithTimeout(
+      apiUrl,
+      {
+        method: "POST",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+          "User-Agent": USER_AGENT
+        },
+        body: JSON.stringify({
+          url: url,
+          videoQuality: "720",
+          downloadMode: "auto"
+        })
       },
-      body: JSON.stringify({
-        url: url,
-        videoQuality: "720",
-        downloadMode: "auto"
-      })
-    });
+      3500
+    );
 
     if (res.ok) {
       const data = await res.json();
       if (data) {
-        if (data.url) {
-          return { type: "video", url: data.url };
-        }
+        if (data.url) return { type: "video", url: data.url };
         if (data.status === "picker" && Array.isArray(data.picker)) {
           const photos = data.picker
             .filter(item => item.type === "photo")
             .map(item => item.url);
-          if (photos.length > 0) {
-            return { type: "photos", urls: photos };
-          }
+          if (photos.length > 0) return { type: "photos", urls: photos };
           const video = data.picker.find(item => item.type === "video");
-          if (video && video.url) {
-            return { type: "video", url: video.url };
-          }
+          if (video && video.url) return { type: "video", url: video.url };
         }
       }
     }
   } catch (err) {
-    console.error("resolveViaCobalt error:", err.message);
+    console.warn("resolveViaCobalt error:", err.message);
   }
 
   return null;

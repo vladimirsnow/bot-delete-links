@@ -4,7 +4,11 @@
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
+    "@sasmeee/igdl": "^0.0.1-security",
     "btch-downloader": "^6.4.0",
-    "instagram-url-direct": "^2.0.7"
+    "instagram-url-direct": "^2.0.7",
+    "metadownloader": "^1.0.0",
+    "snapsave-media-downloader": "^2.5.1",
+    "ultra-igdl": "^1.0.3"
   }
 }

@@ -4,7 +4,23 @@ const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 /**
- * Ищет музыкальный трек по названию или куску текста во всех доступных источниках.
+ * Хелпер для fetch с жестким таймаутом (предотвращает зависания)
+ */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(id);
+    return res;
+  } catch (err) {
+    clearTimeout(id);
+    throw err;
+  }
+}
+
+/**
+ * Быстрый поиск музыкального трека по названию или фрагменту текста
  * Возвращает: { title: string, performer: string, duration?: number, url: string, source: string } | null
  */
 export async function searchTrack(query) {
@@ -12,9 +28,9 @@ export async function searchTrack(query) {
   const cleanQuery = query.trim();
   if (!cleanQuery) return null;
 
-  console.log(`[Music] Searching for track: "${cleanQuery}"`);
+  console.log(`[Music] Searching for: "${cleanQuery}"`);
 
-  // 1. Поиск в базе Muzofond (полные MP3 треки, огромная база русскоязычной и мировой музыки)
+  // 1. Быстрый поиск в Muzofond (прямой MP3, время ответа < 500мс)
   try {
     const muzofondResult = await searchMuzofond(cleanQuery);
     if (muzofondResult && muzofondResult.url) {
@@ -22,10 +38,30 @@ export async function searchTrack(query) {
       return muzofondResult;
     }
   } catch (err) {
-    console.error("[Music] Muzofond error:", err.message);
+    console.warn("[Music] Muzofond error:", err.message);
   }
 
-  // 2. Поиск через YouTube + получение MP3 аудио-потока
+  // 2. Параллельный поиск через Deezer и iTunes (быстрые официальные API, < 1с)
+  try {
+    const [deezerResult, itunesResult] = await Promise.allSettled([
+      searchDeezer(cleanQuery),
+      searchITunes(cleanQuery)
+    ]);
+
+    if (deezerResult.status === "fulfilled" && deezerResult.value?.url) {
+      console.log(`[Music] Found on Deezer: "${deezerResult.value.performer} - ${deezerResult.value.title}"`);
+      return deezerResult.value;
+    }
+
+    if (itunesResult.status === "fulfilled" && itunesResult.value?.url) {
+      console.log(`[Music] Found on iTunes: "${itunesResult.value.performer} - ${itunesResult.value.title}"`);
+      return itunesResult.value;
+    }
+  } catch (err) {
+    console.warn("[Music] Deezer/iTunes error:", err.message);
+  }
+
+  // 3. Фоллбек на YouTube Search + btch mp3 (таймаут 6с)
   try {
     const ytResult = await searchYouTubeMusic(cleanQuery);
     if (ytResult && ytResult.url) {
@@ -33,29 +69,7 @@ export async function searchTrack(query) {
       return ytResult;
     }
   } catch (err) {
-    console.error("[Music] YouTube Music search error:", err.message);
-  }
-
-  // 3. Поиск через Deezer
-  try {
-    const deezerResult = await searchDeezer(cleanQuery);
-    if (deezerResult && deezerResult.url) {
-      console.log(`[Music] Found on Deezer: "${deezerResult.performer} - ${deezerResult.title}"`);
-      return deezerResult;
-    }
-  } catch (err) {
-    console.error("[Music] Deezer search error:", err.message);
-  }
-
-  // 4. Поиск через iTunes
-  try {
-    const itunesResult = await searchITunes(cleanQuery);
-    if (itunesResult && itunesResult.url) {
-      console.log(`[Music] Found on iTunes: "${itunesResult.performer} - ${itunesResult.title}"`);
-      return itunesResult;
-    }
-  } catch (err) {
-    console.error("[Music] iTunes search error:", err.message);
+    console.warn("[Music] YouTube Music search error:", err.message);
   }
 
   return null;
@@ -66,18 +80,21 @@ export async function searchTrack(query) {
  */
 async function searchMuzofond(query) {
   const url = `https://muzofond.fm/search/${encodeURIComponent(query)}`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
-    }
-  });
+  const res = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+      }
+    },
+    3500
+  );
 
   if (!res.ok) return null;
 
   const html = await res.text();
 
-  // Ищем первый трек с кнопкой play и data-url
   const playMatch =
     html.match(/<li[^>]*class="play"[^>]*data-url="([^"]+)"/i) ||
     html.match(/data-url="(https:\/\/[^"]*muzofond\.fm\/[^"]+)"/i) ||
@@ -86,7 +103,6 @@ async function searchMuzofond(query) {
   if (!playMatch) return null;
 
   let directUrl = playMatch[1];
-  // Расшифровываем base64 ссылку, если есть
   if (directUrl.includes("/")) {
     const parts = directUrl.split("/");
     const b64 = parts[parts.length - 1];
@@ -96,11 +112,10 @@ async function searchMuzofond(query) {
         directUrl = decoded;
       }
     } catch {
-      // Использовать исходный URL
+      // ignore
     }
   }
 
-  // Извлекаем исполнителя, название и длительность
   const artistMatch = html.match(/<span class="artist">([^<]+)<\/span>/i);
   const trackMatch = html.match(/<span class="track">([^<]+)<\/span>/i);
   const durationMatch = html.match(/data-duration="(\d+)"/i);
@@ -125,12 +140,16 @@ async function searchYouTubeMusic(query) {
   const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(
     query + " audio"
   )}`;
-  const res = await fetch(searchUrl, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
-    }
-  });
+  const res = await fetchWithTimeout(
+    searchUrl,
+    {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+      }
+    },
+    3500
+  );
 
   if (!res.ok) return null;
 
@@ -142,7 +161,12 @@ async function searchYouTubeMusic(query) {
   if (uniqueIds.length === 0) return null;
 
   const videoId = uniqueIds[0];
-  const ytData = await btch.youtube(`https://www.youtube.com/watch?v=${videoId}`);
+  const ytData = await Promise.race([
+    btch.youtube(`https://www.youtube.com/watch?v=${videoId}`),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("btch.youtube timeout")), 5000)
+    )
+  ]);
 
   if (ytData && ytData.status && (ytData.mp3 || ytData.mp4)) {
     let title = ytData.title || query;
@@ -177,7 +201,7 @@ async function searchYouTubeMusic(query) {
  */
 async function searchDeezer(query) {
   const url = `https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=1`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, {}, 2500);
   if (!res.ok) return null;
 
   const data = await res.json();
@@ -202,7 +226,7 @@ async function searchITunes(query) {
   const url = `https://itunes.apple.com/search?term=${encodeURIComponent(
     query
   )}&media=music&entity=song&limit=1`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, {}, 2500);
   if (!res.ok) return null;
 
   const data = await res.json();
