@@ -398,35 +398,39 @@ async function sendTelegramAudio(token, chatId, replyToMessageId, track, request
  * Отправка видео ответом на сообщение
  */
 async function sendTelegramVideo(token, chatId, replyToMessageId, videoUrl) {
-  // 1. Попытка отправить через прямую ссылку (таймаут 4с)
-  try {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), 4000);
+  const isInstagramCdn = videoUrl.includes("cdninstagram.com") || videoUrl.includes("fbcdn.net");
 
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendVideo`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        video: videoUrl,
-        reply_to_message_id: replyToMessageId,
-        allow_sending_without_reply: true,
-        supports_streaming: true
-      }),
-      signal: controller.signal
-    });
+  // 1. Попытка отправить через прямую ссылку (только для сервисов без блокировки серверов Telegram)
+  if (!isInstagramCdn) {
+    try {
+      const controller = new AbortController();
+      const id = setTimeout(() => controller.abort(), 2500);
 
-    clearTimeout(id);
-    const data = await res.json();
-    if (data.ok) return true;
-  } catch (err) {
-    console.warn("[Telegram] sendTelegramVideo direct URL skipped:", err.message);
+      const res = await fetch(`https://api.telegram.org/bot${token}/sendVideo`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          video: videoUrl,
+          reply_to_message_id: replyToMessageId,
+          allow_sending_without_reply: true,
+          supports_streaming: true
+        }),
+        signal: controller.signal
+      });
+
+      clearTimeout(id);
+      const data = await res.json();
+      if (data.ok) return true;
+    } catch (err) {
+      console.warn("[Telegram] sendTelegramVideo direct URL skipped:", err.message);
+    }
   }
 
-  // 2. Фоллбек: скачивание и отправка через буфер
+  // 2. Скачивание и отправка через буфер
   try {
     const fetchController = new AbortController();
-    const fetchId = setTimeout(() => fetchController.abort(), 18000);
+    const fetchId = setTimeout(() => fetchController.abort(), 15000);
 
     const videoRes = await fetch(videoUrl, {
       headers: {
