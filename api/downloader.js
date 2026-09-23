@@ -1,5 +1,7 @@
-// Модуль для извлечения медиа (видео/фото) из TikTok, Instagram, YouTube Shorts
+// Модуль для извлечения медиа (видео/фото/аудио) из TikTok, Instagram, YouTube
 import btch from "btch-downloader";
+import { snapsave } from "snapsave-media-downloader";
+import igDirect from "instagram-url-direct";
 
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -7,9 +9,9 @@ const USER_AGENT =
 const BOT_USER_AGENT = "TelegramBot (like TwitterBot)";
 
 /**
- * Хелпер для fetch с таймаутом (устраняет задержки)
+ * Хелпер для fetch с таймаутом
  */
-async function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -23,7 +25,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
 }
 
 /**
- * Извлекает первую ссылку на TikTok, Instagram или YouTube Shorts из текста/entities
+ * Извлекает первую ссылку на TikTok, Instagram или YouTube из текста/entities
  */
 export function extractMediaUrl(text, entities = []) {
   if (!text) return null;
@@ -54,8 +56,16 @@ export function isSupportedMediaUrl(url) {
 }
 
 /**
- * Получает прямое видео или массив фото по ссылке
- * Возвращает: { type: 'video', url } | { type: 'photos', urls: [] } | { type: 'photo', url } | null
+ * Получает прямое видео или массив фото (и аудио, если есть) по ссылке
+ * Возвращает:
+ * {
+ *   type: 'video' | 'photos' | 'photo',
+ *   url?: string,
+ *   urls?: string[],
+ *   audioUrl?: string,
+ *   audioTitle?: string,
+ *   audioAuthor?: string
+ * } | null
  */
 export async function resolveMedia(url) {
   if (!url) return null;
@@ -65,7 +75,7 @@ export async function resolveMedia(url) {
     return await resolveTikTok(url);
   }
 
-  // Instagram (Reels, Posts)
+  // Instagram (Reels, Posts, Carousels)
   if (/instagram\.com/i.test(url)) {
     return await resolveInstagram(url);
   }
@@ -79,10 +89,10 @@ export async function resolveMedia(url) {
 }
 
 /**
- * Резолвер для TikTok с мульти-уровневым фоллбеком
+ * Резолвер для TikTok с мульти-уровневым каскадом
  */
 async function resolveTikTok(url) {
-  // 1. TikWM API (< 1c)
+  // 1. TikWM API
   try {
     const res = await fetchWithTimeout(
       "https://www.tikwm.com/api/",
@@ -95,19 +105,31 @@ async function resolveTikTok(url) {
         },
         body: new URLSearchParams({ url, count: "12", cursor: "0", web: "1", hd: "1" })
       },
-      3000
+      5000
     );
 
     if (res.ok) {
       const data = await res.json();
       if (data && data.data) {
+        const audioUrl = data.data.music || data.data.music_info?.play;
+        const fullAudioUrl = audioUrl
+          ? (audioUrl.startsWith("http") ? audioUrl : `https://www.tikwm.com${audioUrl}`)
+          : undefined;
+        const audioTitle = data.data.music_info?.title || "TikTok Audio";
+        const audioAuthor = data.data.music_info?.author || data.data.author?.nickname;
+
+        // Если это фото-слайды (карусель)
         if (Array.isArray(data.data.images) && data.data.images.length > 0) {
           return {
             type: "photos",
-            urls: data.data.images
+            urls: data.data.images,
+            audioUrl: fullAudioUrl,
+            audioTitle,
+            audioAuthor
           };
         }
 
+        // Если это видео
         const videoUrl = data.data.hdplay || data.data.play || data.data.wmplay;
         if (videoUrl) {
           const fullUrl = videoUrl.startsWith("http")
@@ -121,22 +143,58 @@ async function resolveTikTok(url) {
       }
     }
   } catch (err) {
-    console.warn("resolveTikTok TikWM error:", err.message);
+    console.warn("[Downloader] resolveTikTok TikWM error:", err.message);
   }
 
-  // 2. Tiklydown API
+  // 2. Snapsave Media Downloader
+  try {
+    const snapResult = await snapsave(url);
+    if (snapResult && snapResult.success && snapResult.data?.media?.length > 0) {
+      const mediaList = snapResult.data.media;
+      const videos = mediaList.filter(m => m.type === "video");
+      const photos = mediaList.filter(m => m.type === "photo" || m.type === "image");
+
+      if (photos.length > 1) {
+        return {
+          type: "photos",
+          urls: photos.map(p => p.url)
+        };
+      } else if (photos.length === 1 && videos.length === 0) {
+        return {
+          type: "photo",
+          url: photos[0].url
+        };
+      } else if (videos.length > 0) {
+        return {
+          type: "video",
+          url: videos[0].url
+        };
+      }
+    }
+  } catch (err) {
+    console.warn("[Downloader] resolveTikTok Snapsave error:", err.message);
+  }
+
+  // 3. Tiklydown API
   try {
     const res = await fetchWithTimeout(
       `https://api.tiklydown.eu.org/api/download?url=${encodeURIComponent(url)}`,
       {},
-      3000
+      5000
     );
     if (res.ok) {
       const data = await res.json();
+      const audioUrl = data.music?.play_url;
+      const audioTitle = data.music?.title || "TikTok Audio";
+      const audioAuthor = data.music?.author;
+
       if (data.images && Array.isArray(data.images) && data.images.length > 0) {
         return {
           type: "photos",
-          urls: data.images.map(img => img.url || img)
+          urls: data.images.map(img => img.url || img),
+          audioUrl,
+          audioTitle,
+          audioAuthor
         };
       }
       const video = data.video?.noWatermark || data.video?.watermark || data.video?.url;
@@ -145,20 +203,25 @@ async function resolveTikTok(url) {
       }
     }
   } catch (err) {
-    console.warn("resolveTikTok Tiklydown error:", err.message);
+    console.warn("[Downloader] resolveTikTok Tiklydown error:", err.message);
   }
 
-  // 3. btch.douyin fallback
+  // 4. btch.douyin fallback
   try {
     const data = await Promise.race([
       btch.douyin(url),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("btch timeout")), 3000))
+      new Promise((_, reject) => setTimeout(() => reject(new Error("btch timeout")), 6000))
     ]);
     if (data && data.status && data.result?.video) {
       return { type: "video", url: data.result.video };
     }
   } catch (err) {
-    console.warn("resolveTikTok btch error:", err.message);
+    console.warn("[Downloader] resolveTikTok btch error:", err.message);
+  }
+
+  // 5. Резервный Cobalt
+  if (process.env.COBALT_API_URL) {
+    return await resolveViaCobalt(url);
   }
 
   return null;
@@ -173,26 +236,78 @@ function extractInstagramShortcode(url) {
 }
 
 /**
- * Резолвер для Instagram (Reels / Posts / Photos)
+ * Резолвер для Instagram (Reels / Posts / Photos / Carousels)
  */
 async function resolveInstagram(url) {
   const shortcode = extractInstagramShortcode(url);
 
-  // 1. Попытка через официальный GraphQL Polaris API (если задан INSTAGRAM_COOKIE в .env, работает 100%)
+  // 1. Попытка через официальный GraphQL Polaris API
   if (shortcode) {
     try {
       const gqlResult = await resolveInstagramGraphQL(shortcode);
       if (gqlResult) return gqlResult;
     } catch (err) {
-      console.warn("resolveInstagram GraphQL error:", err.message);
+      console.warn("[Downloader] resolveInstagram GraphQL error:", err.message);
     }
   }
 
-  // 2. Попытка через Discord/Telegram прокси eeinstagram / ddinstagram / vxinstagram
+  // 2. Snapsave Media Downloader
+  try {
+    const snapResult = await snapsave(url);
+    if (snapResult && snapResult.success && snapResult.data?.media?.length > 0) {
+      const mediaList = snapResult.data.media;
+      const videos = mediaList.filter(m => m.type === "video");
+      const photos = mediaList.filter(m => m.type === "photo" || m.type === "image");
+
+      if (photos.length > 1) {
+        return {
+          type: "photos",
+          urls: photos.map(p => p.url)
+        };
+      } else if (photos.length === 1 && videos.length === 0) {
+        return {
+          type: "photo",
+          url: photos[0].url
+        };
+      } else if (videos.length > 0) {
+        return {
+          type: "video",
+          url: videos[0].url
+        };
+      }
+    }
+  } catch (err) {
+    console.warn("[Downloader] resolveInstagram Snapsave error:", err.message);
+  }
+
+  // 3. instagram-url-direct
+  try {
+    const getIgUrl = igDirect?.instagramGetUrl || igDirect;
+    if (typeof getIgUrl === "function") {
+      const igDirectResult = await Promise.race([
+        getIgUrl(url),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("igDirect timeout")), 6000))
+      ]);
+      if (igDirectResult && igDirectResult.url_list && igDirectResult.url_list.length > 0) {
+        const validUrls = igDirectResult.url_list.filter(u => typeof u === "string" && u.startsWith("http"));
+        if (validUrls.length > 1) {
+          return { type: "photos", urls: validUrls };
+        } else if (validUrls.length === 1) {
+          const isVid = validUrls[0].includes(".mp4");
+          return { type: isVid ? "video" : "photo", url: validUrls[0] };
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[Downloader] resolveInstagram igDirect error:", err.message);
+  }
+
+  // 4. Попытка через Discord/Telegram прокси eeinstagram / ddinstagram / kkinstagram / vxinstagram
   if (shortcode) {
     const proxyHosts = [
-      `https://eeinstagram.com/reel/${shortcode}`,
       `https://ddinstagram.com/reel/${shortcode}`,
+      `https://kkinstagram.com/reel/${shortcode}`,
+      `https://eeinstagram.com/reel/${shortcode}`,
       `https://vxinstagram.com/reel/${shortcode}`,
       `https://instagramez.com/reel/${shortcode}`
     ];
@@ -202,7 +317,7 @@ async function resolveInstagram(url) {
         const res = await fetchWithTimeout(
           pUrl,
           { headers: { "User-Agent": BOT_USER_AGENT } },
-          2500
+          3500
         );
         if (res.ok) {
           const html = await res.text();
@@ -216,7 +331,7 @@ async function resolveInstagram(url) {
           const photoMatch =
             html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i) ||
             html.match(/content=["']([^"']+)["'][^>]+og:image/i);
-          if (photoMatch && photoMatch[1] && photoMatch[1].startsWith("http") && !photoMatch[1].includes("ddinstagram")) {
+          if (photoMatch && photoMatch[1] && photoMatch[1].startsWith("http") && !photoMatch[1].includes("ddinstagram") && !photoMatch[1].includes("kkinstagram")) {
             return { type: "photo", url: photoMatch[1] };
           }
         }
@@ -226,11 +341,11 @@ async function resolveInstagram(url) {
     }
   }
 
-  // 3. Попытка через btch.igdl (таймаут 3с)
+  // 5. btch.igdl
   try {
     const data = await Promise.race([
       btch.igdl(url),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("btch.igdl timeout")), 3000))
+      new Promise((_, reject) => setTimeout(() => reject(new Error("btch.igdl timeout")), 6000))
     ]);
     if (data && data.status && Array.isArray(data.result)) {
       const validMedia = data.result.filter(item => item.url && item.url.startsWith("http"));
@@ -249,10 +364,10 @@ async function resolveInstagram(url) {
       }
     }
   } catch (err) {
-    console.warn("resolveInstagram btch error:", err.message);
+    console.warn("[Downloader] resolveInstagram btch error:", err.message);
   }
 
-  // 4. Универсальный фоллбек через Cobalt (если задан COBALT_API_URL)
+  // 6. Cobalt
   if (process.env.COBALT_API_URL) {
     return await resolveViaCobalt(url);
   }
@@ -312,7 +427,7 @@ async function resolveInstagramGraphQL(shortcode) {
       headers,
       body: bodyParams.toString()
     },
-    3500
+    5000
   );
 
   if (!res.ok) return null;
@@ -321,13 +436,19 @@ async function resolveInstagramGraphQL(shortcode) {
   const media = json.data?.xdt_shortcode_media;
   if (!media) return null;
 
+  // Извлекаем аудио трек, если он есть
+  const audioUrl =
+    media.clips_metadata?.audio_type_model?.audio_asset?.audio_asset_url ||
+    media.audio_src ||
+    undefined;
+
   // Карусель фото/видео
   if (media.edge_sidecar_to_children?.edges?.length > 0) {
     const photos = media.edge_sidecar_to_children.edges
       .map(edge => edge.node?.display_url)
       .filter(Boolean);
     if (photos.length > 0) {
-      return { type: "photos", urls: photos };
+      return { type: "photos", urls: photos, audioUrl };
     }
   }
 
@@ -338,7 +459,7 @@ async function resolveInstagramGraphQL(shortcode) {
 
   // Фото
   if (media.display_url) {
-    return { type: "photo", url: media.display_url };
+    return { type: "photo", url: media.display_url, audioUrl };
   }
 
   return null;
@@ -351,7 +472,7 @@ async function resolveYouTube(url) {
   try {
     const ytData = await Promise.race([
       btch.youtube(url),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("btch.youtube timeout")), 4000))
+      new Promise((_, reject) => setTimeout(() => reject(new Error("btch.youtube timeout")), 15000))
     ]);
 
     if (ytData && ytData.status && ytData.mp4) {
@@ -361,7 +482,7 @@ async function resolveYouTube(url) {
       };
     }
   } catch (err) {
-    console.warn("resolveYouTube error:", err.message);
+    console.warn("[Downloader] resolveYouTube error:", err.message);
   }
 
   if (process.env.COBALT_API_URL) {
@@ -372,7 +493,7 @@ async function resolveYouTube(url) {
 }
 
 /**
- * Фоллбек через кастомный инстанс Cobalt
+ * Фоллбек через Cobalt
  */
 async function resolveViaCobalt(url) {
   const customCobalt = process.env.COBALT_API_URL;
@@ -395,7 +516,7 @@ async function resolveViaCobalt(url) {
           downloadMode: "auto"
         })
       },
-      3500
+      8000
     );
 
     if (res.ok) {
@@ -406,14 +527,21 @@ async function resolveViaCobalt(url) {
           const photos = data.picker
             .filter(item => item.type === "photo")
             .map(item => item.url);
-          if (photos.length > 0) return { type: "photos", urls: photos };
+          const audio = data.picker.find(item => item.type === "audio");
+          if (photos.length > 0) {
+            return {
+              type: "photos",
+              urls: photos,
+              audioUrl: audio?.url
+            };
+          }
           const video = data.picker.find(item => item.type === "video");
           if (video && video.url) return { type: "video", url: video.url };
         }
       }
     }
   } catch (err) {
-    console.warn("resolveViaCobalt error:", err.message);
+    console.warn("[Downloader] resolveViaCobalt error:", err.message);
   }
 
   return null;

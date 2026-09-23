@@ -4,9 +4,9 @@ const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 /**
- * Хелпер для fetch с жестким таймаутом (предотвращает зависания)
+ * Хелпер для fetch с таймаутом
  */
-async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -20,17 +20,43 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
 }
 
 /**
- * Быстрый поиск музыкального трека по названию или фрагменту текста
- * Возвращает: { title: string, performer: string, duration?: number, url: string, source: string } | null
+ * Полноценный поиск музыкального трека
+ * Возвращает полную версию трека (НЕ 30-секундное превью!), длительность и обложку
+ * @param {string} query Запрос пользователя
+ * @returns {Promise<{ title: string, performer: string, duration?: number, url: string, thumbnail?: string, source: string } | null>}
  */
 export async function searchTrack(query) {
   if (!query || typeof query !== "string") return null;
   const cleanQuery = query.trim();
   if (!cleanQuery) return null;
 
-  console.log(`[Music] Searching for: "${cleanQuery}"`);
+  console.log(`[Music] Searching for full track: "${cleanQuery}"`);
 
-  // 1. Быстрый поиск в Muzofond (прямой MP3, время ответа < 500мс)
+  // 1. Полноценный поиск через YouTube (yts) + аудио поток (btch.youtube)
+  try {
+    const ytResult = await searchAndDownloadYouTube(cleanQuery);
+    if (ytResult && ytResult.url) {
+      console.log(`[Music] Found full track on YouTube: "${ytResult.performer} - ${ytResult.title}" (${ytResult.duration}s)`);
+      return ytResult;
+    }
+  } catch (err) {
+    console.warn("[Music] YouTube track search error:", err.message);
+  }
+
+  // 2. Резервный поиск через Cobalt (если настроен инстанс)
+  if (process.env.COBALT_API_URL) {
+    try {
+      const cobaltResult = await searchViaCobalt(cleanQuery);
+      if (cobaltResult && cobaltResult.url) {
+        console.log(`[Music] Found on Cobalt: "${cobaltResult.performer} - ${cobaltResult.title}"`);
+        return cobaltResult;
+      }
+    } catch (err) {
+      console.warn("[Music] Cobalt search error:", err.message);
+    }
+  }
+
+  // 3. Резервный поиск через Muzofond (полный MP3)
   try {
     const muzofondResult = await searchMuzofond(cleanQuery);
     if (muzofondResult && muzofondResult.url) {
@@ -41,42 +67,170 @@ export async function searchTrack(query) {
     console.warn("[Music] Muzofond error:", err.message);
   }
 
-  // 2. Параллельный поиск через Deezer и iTunes (быстрые официальные API, < 1с)
+  return null;
+}
+
+/**
+ * Поиск трека на YouTube и извлечение полного аудиофайла
+ */
+async function searchAndDownloadYouTube(query) {
+  // 1. Поиск видео через yts
+  let searchRes;
   try {
-    const [deezerResult, itunesResult] = await Promise.allSettled([
-      searchDeezer(cleanQuery),
-      searchITunes(cleanQuery)
+    searchRes = await Promise.race([
+      btch.yts(query),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("yts timeout")), 6000))
     ]);
-
-    if (deezerResult.status === "fulfilled" && deezerResult.value?.url) {
-      console.log(`[Music] Found on Deezer: "${deezerResult.value.performer} - ${deezerResult.value.title}"`);
-      return deezerResult.value;
-    }
-
-    if (itunesResult.status === "fulfilled" && itunesResult.value?.url) {
-      console.log(`[Music] Found on iTunes: "${itunesResult.value.performer} - ${itunesResult.value.title}"`);
-      return itunesResult.value;
-    }
   } catch (err) {
-    console.warn("[Music] Deezer/iTunes error:", err.message);
+    console.warn("[Music] yts search timeout/error:", err.message);
+    return null;
   }
 
-  // 3. Фоллбек на YouTube Search + btch mp3 (таймаут 6с)
+  const videos = searchRes?.result?.videos || searchRes?.result?.all?.filter(item => item.type === "video") || [];
+  if (videos.length === 0) {
+    return null;
+  }
+
+  // Выбираем наиболее подходящее видео (обычно первое)
+  const video = videos[0];
+  const videoUrl = video.url || `https://youtube.com/watch?v=${video.videoId}`;
+  const durationSec = video.duration?.seconds || video.seconds || 0;
+  const coverUrl = video.image || video.thumbnail || `https://i.ytimg.com/vi/${video.videoId}/hqdefault.jpg`;
+
+  console.log(`[Music] Selected YouTube candidate: "${video.title}" by ${video.author?.name || "Unknown"} [${videoUrl}]`);
+
+  // 2. Скачивание аудиопотока через btch.youtube (таймаут 15с)
+  let ytData;
   try {
-    const ytResult = await searchYouTubeMusic(cleanQuery);
-    if (ytResult && ytResult.url) {
-      console.log(`[Music] Found on YouTube: "${ytResult.performer} - ${ytResult.title}"`);
-      return ytResult;
-    }
+    ytData = await Promise.race([
+      btch.youtube(videoUrl),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("btch.youtube timeout")), 15000))
+    ]);
   } catch (err) {
-    console.warn("[Music] YouTube Music search error:", err.message);
+    console.warn("[Music] btch.youtube error:", err.message);
+  }
+
+  const directAudioUrl = ytData?.mp3 || ytData?.mp4;
+
+  if (ytData && ytData.status && directAudioUrl) {
+    // Парсим автора и название из заголовка видео
+    let rawTitle = ytData.title || video.title || query;
+    let performer = (video.author?.name || ytData.author || "").replace(/ - Topic$/i, "").trim();
+    let title = rawTitle;
+
+    if (rawTitle.includes(" - ")) {
+      const parts = rawTitle.split(" - ");
+      if (!performer || performer.toLowerCase().includes("topic")) {
+        performer = parts[0].trim();
+      }
+      title = parts
+        .slice(1)
+        .join(" - ")
+        .replace(/\(Official.*?\)/gi, "")
+        .replace(/\(Audio.*?\)/gi, "")
+        .replace(/\(Lyric.*?\)/gi, "")
+        .replace(/\[Official.*?\]/gi, "")
+        .replace(/\[Audio.*?\]/gi, "")
+        .replace(/\[Lyric.*?\]/gi, "")
+        .trim();
+    }
+
+    return {
+      title: title || query,
+      performer: performer || "",
+      duration: durationSec || undefined,
+      url: directAudioUrl,
+      thumbnail: coverUrl,
+      source: "youtube"
+    };
+  }
+
+  // Если btch.youtube не отдал прямой URL, но у нас есть инстанс Cobalt
+  if (process.env.COBALT_API_URL) {
+    const cobaltAudio = await downloadAudioViaCobalt(videoUrl);
+    if (cobaltAudio) {
+      return {
+        title: video.title || query,
+        performer: (video.author?.name || "").replace(/ - Topic$/i, "").trim(),
+        duration: durationSec || undefined,
+        url: cobaltAudio,
+        thumbnail: coverUrl,
+        source: "youtube+cobalt"
+      };
+    }
   }
 
   return null;
 }
 
 /**
- * Парсер поиска Muzofond
+ * Извлечение аудио через Cobalt API
+ */
+async function downloadAudioViaCobalt(videoUrl) {
+  const cobalt = process.env.COBALT_API_URL;
+  if (!cobalt) return null;
+
+  try {
+    const apiUrl = cobalt.endsWith("/") ? cobalt : `${cobalt}/`;
+    const res = await fetchWithTimeout(
+      apiUrl,
+      {
+        method: "POST",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+          "User-Agent": USER_AGENT
+        },
+        body: JSON.stringify({
+          url: videoUrl,
+          downloadMode: "audio",
+          audioFormat: "mp3"
+        })
+      },
+      8000
+    );
+
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.url) return data.url;
+    }
+  } catch (err) {
+    console.warn("[Music] downloadAudioViaCobalt error:", err.message);
+  }
+
+  return null;
+}
+
+/**
+ * Поиск через Cobalt
+ */
+async function searchViaCobalt(query) {
+  // Находим видео на YouTube и скачиваем через Cobalt
+  try {
+    const searchRes = await btch.yts(query);
+    const video = searchRes?.result?.videos?.[0];
+    if (!video) return null;
+
+    const videoUrl = video.url || `https://youtube.com/watch?v=${video.videoId}`;
+    const audioUrl = await downloadAudioViaCobalt(videoUrl);
+    if (audioUrl) {
+      return {
+        title: video.title || query,
+        performer: (video.author?.name || "").replace(/ - Topic$/i, "").trim(),
+        duration: video.duration?.seconds || video.seconds,
+        url: audioUrl,
+        thumbnail: video.image || video.thumbnail,
+        source: "cobalt"
+      };
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/**
+ * Парсер поиска Muzofond (полный MP3 файл)
  */
 async function searchMuzofond(query) {
   const url = `https://muzofond.fm/search/${encodeURIComponent(query)}`;
@@ -88,7 +242,7 @@ async function searchMuzofond(query) {
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
       }
     },
-    3500
+    5000
   );
 
   if (!res.ok) return null;
@@ -131,115 +285,4 @@ async function searchMuzofond(query) {
     url: directUrl,
     source: "muzofond"
   };
-}
-
-/**
- * Поиск музыки на YouTube + извлечение аудио потока
- */
-async function searchYouTubeMusic(query) {
-  const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(
-    query + " audio"
-  )}`;
-  const res = await fetchWithTimeout(
-    searchUrl,
-    {
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
-      }
-    },
-    3500
-  );
-
-  if (!res.ok) return null;
-
-  const html = await res.text();
-  const videoIds = [...html.matchAll(/"videoId":"([a-zA-Z0-9_-]{11})"/g)].map(
-    m => m[1]
-  );
-  const uniqueIds = [...new Set(videoIds)];
-  if (uniqueIds.length === 0) return null;
-
-  const videoId = uniqueIds[0];
-  const ytData = await Promise.race([
-    btch.youtube(`https://www.youtube.com/watch?v=${videoId}`),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("btch.youtube timeout")), 5000)
-    )
-  ]);
-
-  if (ytData && ytData.status && (ytData.mp3 || ytData.mp4)) {
-    let title = ytData.title || query;
-    let performer = ytData.author || "";
-
-    if (title.includes(" - ")) {
-      const parts = title.split(" - ");
-      performer = parts[0].trim();
-      title = parts
-        .slice(1)
-        .join(" - ")
-        .replace(/\(Official.*?\)/gi, "")
-        .replace(/\(Audio.*?\)/gi, "")
-        .replace(/\[Official.*?\]/gi, "")
-        .replace(/\[Audio.*?\]/gi, "")
-        .trim();
-    }
-
-    return {
-      title,
-      performer,
-      url: ytData.mp3 || ytData.mp4,
-      source: "youtube"
-    };
-  }
-
-  return null;
-}
-
-/**
- * Поиск через Deezer API
- */
-async function searchDeezer(query) {
-  const url = `https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=1`;
-  const res = await fetchWithTimeout(url, {}, 2500);
-  if (!res.ok) return null;
-
-  const data = await res.json();
-  if (data.data && data.data.length > 0) {
-    const s = data.data[0];
-    return {
-      title: s.title,
-      performer: s.artist?.name || "",
-      duration: s.duration,
-      url: s.preview,
-      source: "deezer"
-    };
-  }
-
-  return null;
-}
-
-/**
- * Поиск через iTunes API
- */
-async function searchITunes(query) {
-  const url = `https://itunes.apple.com/search?term=${encodeURIComponent(
-    query
-  )}&media=music&entity=song&limit=1`;
-  const res = await fetchWithTimeout(url, {}, 2500);
-  if (!res.ok) return null;
-
-  const data = await res.json();
-  if (data.resultCount > 0 && data.results[0]) {
-    const s = data.results[0];
-    return {
-      title: s.trackName,
-      performer: s.artistName,
-      duration: Math.round(s.trackTimeMillis / 1000),
-      url: s.previewUrl,
-      source: "itunes"
-    };
-  }
-
-  return null;
 }
